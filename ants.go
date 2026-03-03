@@ -90,10 +90,12 @@ var (
 	// workerChanCap determines whether the channel of a worker should be a buffered channel
 	// to get the best performance. Inspired by fasthttp at
 	// https://github.com/valyala/fasthttp/blob/master/workerpool.go#L139
+	// 单核用同步交接，多核用轻度缓冲，避免 sender 被 CPU-bound receiver 拖慢。背压模型（Backpressure Model）
 	workerChanCap = func() int {
 		// Use blocking channel if GOMAXPROCS=1.
 		// This switches context from sender to receiver immediately,
 		// which results in higher performance (under go1.5 at least).
+		// 在 Go1.5 下，这种策略被验证性能更好
 		if runtime.GOMAXPROCS(0) == 1 {
 			return 0
 		}
@@ -283,7 +285,8 @@ func (p *poolCommon) purgeStaleWorkers() {
 
 const nowTimeUpdateInterval = 500 * time.Millisecond
 
-// ticktock is a goroutine that updates the current time in the pool regularly.
+// ticktock is a goroutine that updates the current time in the pool regularly.当前时间“”
+// 定期更新 pool 的“当前时间”，避免在高频路径中频繁调用 time.Now()，这是一个性能微优化 + 统一时间源的设计
 func (p *poolCommon) ticktock() {
 	ticker := time.NewTicker(nowTimeUpdateInterval)
 	defer func() {
@@ -425,6 +428,7 @@ func (p *poolCommon) ReleaseTimeout(timeout time.Duration) error {
 			return ErrTimeout
 		case <-p.allDone:
 			<-purgeCh
+			// 这个好像没必要了
 			<-p.ticktockCtx.Done()
 			if p.Running() == 0 &&
 				(p.options.DisablePurge || atomic.LoadInt32(&p.purgeDone) == 1) &&
@@ -439,6 +443,7 @@ func (p *poolCommon) ReleaseTimeout(timeout time.Duration) error {
 // If you intend to reboot a closed pool, use ReleaseTimeout() instead of
 // Release() to ensure that all workers are stopped and resource are released
 // before rebooting, otherwise you may run into data race.
+// 只能重启已经 Release 掉的 Pool
 func (p *poolCommon) Reboot() {
 	if atomic.CompareAndSwapInt32(&p.state, CLOSED, OPENED) {
 		atomic.StoreInt32(&p.purgeDone, 0)
@@ -480,12 +485,14 @@ retry:
 
 	// Bail out early if it's in nonblocking mode or the number of pending callers reaches the maximum limit value.
 	if p.options.Nonblocking || (p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
+		// 非阻塞模式或者等待中的任务数 >= 最大等待任务数，直接丢弃
 		p.lock.Unlock()
 		return nil, ErrPoolOverload
 	}
 
 	// Otherwise, we'll have to keep them blocked and wait for at least one worker to be put back into pool.
 	p.addWaiting(1)
+	// 等待被 revertWorker 唤醒
 	p.cond.Wait() // block and wait for an available worker
 	p.addWaiting(-1)
 
@@ -500,6 +507,8 @@ retry:
 // revertWorker puts a worker back into free pool, recycling the goroutines.
 func (p *poolCommon) revertWorker(worker worker) bool {
 	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || p.IsClosed() {
+		// 线程池当前 worker 数量超配了，不放回 workerQueue，而是放回 worker pool（自然退出 run 就会放回 worker pool）
+		// 唤醒等待方，使其重新检查状态
 		p.cond.Broadcast()
 		return false
 	}
@@ -513,11 +522,13 @@ func (p *poolCommon) revertWorker(worker worker) bool {
 		p.lock.Unlock()
 		return false
 	}
+	// 放回 workerQueue
 	if err := p.workers.insert(worker); err != nil {
 		p.lock.Unlock()
 		return false
 	}
 	// Notify the invoker stuck in 'retrieveWorker()' of there is an available worker in the worker queue.
+	// 随机唤醒等待队列中的一个 goroutine，它将会得到 worker 去执行 task，但不一定这个刚被空闲的 worker
 	p.cond.Signal()
 	p.lock.Unlock()
 

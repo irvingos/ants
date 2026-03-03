@@ -50,10 +50,12 @@ func (w *goWorker) run() {
 	go func() {
 		defer func() {
 			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
+				// 由最后一个活跃的 worker 在结束时标注线程池的状态为 allDone
 				w.pool.once.Do(func() {
 					close(w.pool.allDone)
 				})
 			}
+			// 放回 workerPool
 			w.pool.workerCache.Put(w)
 			if p := recover(); p != nil {
 				if ph := w.pool.options.PanicHandler; ph != nil {
@@ -71,6 +73,9 @@ func (w *goWorker) run() {
 				return
 			}
 			fn()
+			// 两个结果：
+			// 成功：放回 workerQueue，并阻塞在 for fn := range w.task {} 等待任务进来
+			// 失败：放回 workerPool，等待下次被申请
 			if ok := w.pool.revertWorker(w); !ok {
 				return
 			}
